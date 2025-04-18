@@ -1,0 +1,93 @@
+################################################################################
+# 0) 공통 ARG
+################################################################################
+ARG DRIVER_VERSION=535.183.06
+ARG KERNEL_VERSION=5.15.0-119-generic
+ARG OS_TAG=ubuntu22.04
+
+################################################################################
+# 1) repo-builder: nvcr.io 이미지에서 dpkg-dev/wget 설치 → 필수 패키지+의존성 다운로드
+################################################################################
+FROM nvcr.io/nvidia/driver:${DRIVER_VERSION}-${OS_TAG} AS repo-builder
+
+ARG KERNEL_VERSION
+ENV DEBIAN_FRONTEND=noninteractive
+
+# repo 생성용 툴 설치
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      apt-utils \
+      dpkg-dev \
+      wget && \
+    rm -rf /var/lib/apt/lists/*
+
+# 필요한 패키지(.deb)만 다운로드
+RUN apt-get update && \
+    apt-get install --download-only -y \
+      linux-headers-${KERNEL_VERSION} \
+      linux-image-${KERNEL_VERSION} \
+      linux-modules-${KERNEL_VERSION} \
+      dkms \
+      kmod \
+      build-essential
+
+# 로컬 repo 디렉터리 생성 및 파일 복사
+RUN mkdir -p /local-repo && \
+    cp /var/cache/apt/archives/*.deb /local-repo/
+
+# 여기서 WORKDIR 를 바꿔서 dpkg-scanpackages 가 상대경로만 출력하도록 함
+WORKDIR /local-repo
+RUN dpkg-scanpackages . /dev/null | gzip -9c > Packages.gz
+
+################################################################################
+# 2) driver-builder: nvcr.io 이미지에서 온라인으로 헤더/도구 설치 → .run으로 모듈 빌드
+################################################################################
+FROM nvcr.io/nvidia/driver:${DRIVER_VERSION}-${OS_TAG} AS driver-builder
+
+ARG KERNEL_VERSION
+ENV KERNEL_VERSION=${KERNEL_VERSION}
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      dkms \
+      kmod \
+      linux-headers-${KERNEL_VERSION} \
+      wget && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN wget -qO /tmp/NVIDIA-Linux-x86_64-${DRIVER_VERSION}.run \
+    https://us.download.nvidia.com/tesla/${DRIVER_VERSION}/NVIDIA-Linux-x86_64-${DRIVER_VERSION}.run && \
+  sh /tmp/NVIDIA-Linux-x86_64-${DRIVER_VERSION}.run \
+    --kernel-source-path=/usr/src/linux-headers-${KERNEL_VERSION} \
+    --kernel-name=${KERNEL_VERSION} \
+    --dkms --silent --disable-nouveau --no-drm --install-libglvnd && \
+  rm -f /tmp/NVIDIA-Linux-x86_64-${DRIVER_VERSION}.run
+
+################################################################################
+# 3) final: 모듈 + local-repo 복사 → APT 소스 교체 → offline-init 스크립트
+################################################################################
+FROM nvcr.io/nvidia/driver:${DRIVER_VERSION}-${OS_TAG}
+
+ARG KERNEL_VERSION
+ENV KERNEL_VERSION=${KERNEL_VERSION}
+
+# 3.1) driver-builder에서 생성된 모듈·소스·설정 복사
+COPY --from=driver-builder /lib/modules/${KERNEL_VERSION} /lib/modules/${KERNEL_VERSION}
+COPY --from=driver-builder /usr/src/nvidia-${DRIVER_VERSION} /usr/src/nvidia-${DRIVER_VERSION}
+COPY --from=driver-builder /etc/ld.so.conf.d/nvidia.conf /etc/ld.so.conf.d/nvidia.conf
+RUN depmod ${KERNEL_VERSION}
+
+# 3.2) repo-builder에서 만든 경량 로컬 repo 복사
+COPY --from=repo-builder /local-repo /local-repo
+
+# 3.3) APT 소스리스트를 오직 file:///local-repo 만 바라보도록 설정
+RUN mv /etc/apt/sources.list /etc/apt/sources.list.bak && \
+    printf 'deb [trusted=yes] file:///local-repo ./\n' > /etc/apt/sources.list
+
+# 3.4) offline-init 스크립트 덮어쓰기
+COPY offline-init.sh /usr/bin/nvidia-driver
+RUN chmod +x /usr/bin/nvidia-driver
+
+ENTRYPOINT ["nvidia-driver","init"]
+
